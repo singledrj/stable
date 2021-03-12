@@ -34,20 +34,22 @@ class CustomTensorIterator:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--n_steps', default=50, type=int, help='epoch numbers')
+    parser.add_argument('--n_steps', default=80, type=int, help='epoch numbers')
     parser.add_argument('--T', default=10, type=int, help='inner update iterations')
-    parser.add_argument('--batch_size', type=int, default=1000)
-    parser.add_argument('--val_size', type=int, default=1000)
+    parser.add_argument('--batch_size', type=int, default=10)
+    parser.add_argument('--val_size', type=int, default=10)
     parser.add_argument('--eta', type=float, default=0.5, help='used in Hessian')
     parser.add_argument('--K', type=int, default=10, help='number of steps to approximate hessian')
     # Only when alg == minibatch, we apply stochastic, otherwise, alg training with full batch
     parser.add_argument('--alg', type=str, default='minibatch', choices=['minibatch', 'reverse', 'fixed_point', 'CG', 'neuman'])
-    parser.add_argument('--inner_lr', type=float, default=0.05) # beta
+    parser.add_argument('--inner_lr', type=float, default=0.005) # beta
     parser.add_argument('--inner_mu', type=float, default=0.0)
     parser.add_argument('--outer_lr', type=float, default=1e-4) # alpha
     parser.add_argument('--outer_mu', type=float, default=0.0)
     parser.add_argument('--save_folder', type=str, default='', help='path to save result')
     parser.add_argument('--model_name', type=str, default='', help='Experiment name')
+    parser.add_argument('--seed', type=int, default=1, metavar='S', help='random seed (default: 1)')
+    args = parser.parse_args()
     args = parser.parse_args()
     # outer_lr, outer_mu = 100.0, 0.0  # nice with 100.0, 0.0 (torch.SGD) tested with T, K = 5, 10 and CG
     # inner_lr, inner_mu = 100., 0.9   # nice with 100., 0.9 (HeavyBall) tested with T, K = 5, 10 and CG
@@ -81,10 +83,11 @@ def train_model(args):
     np.random.seed(seed)
 
     cuda = True and torch.cuda.is_available() # torch.cuda.is_available() # cuda=False -> CPU version
-    torch.cuda.set_device(1)
+    torch.cuda.set_device(0)
     default_tensor_str = 'torch.cuda.FloatTensor' if cuda else 'torch.FloatTensor'
     kwargs = {} # {'num_workers': 1, 'pin_memory': True} if cuda else {}
     torch.set_default_tensor_type(default_tensor_str)
+    torch.cuda.manual_seed(args.seed)
     # torch.multiprocessing.set_start_method('forkserver')
 
     # Functions 
@@ -207,8 +210,8 @@ def train_model(args):
     # hparams: the outer variables (or hyperparameters)
     ones_dxc = torch.ones(n_features, n_classes)
 
-    outer_opt = torch.optim.SGD(lr=args.outer_lr, momentum=args.outer_mu, params=hparams)
-    # outer_opt = torch.optim.Adam(lr=0.01, params=hparams)
+    # outer_opt = torch.optim.SGD(lr=args.outer_lr, momentum=args.outer_mu, params=hparams)
+    outer_opt = torch.optim.Adam(lr=args.outer_lr, params=hparams)
 
     '''
     For STABLE, params_history is not required, but we need to save Hxy and Hyy
@@ -242,7 +245,9 @@ def train_model(args):
     
     for o_step in range(args.n_steps):
         train_index_list = torch.randperm(train_list_len)
+        print(train_index_list[0])
         val_index_list = torch.randperm(val_list_len)
+        print(val_index_list[0])
         start_time = time.time()
         #  x -> hparas
         #  y -> parameters
@@ -271,40 +276,26 @@ def train_model(args):
             hy_k_1 = torch.reshape(hy_k_1, [-1])
             hx_k_1 = torch.autograd.grad(loss_train_k_1, x_prev, retain_graph=True, create_graph=True)[0]
             hx_k_1 = torch.reshape(hx_k_1, [-1])
-            print('Hessian break point 2')
             hyy_k_1 = eval_hessian(hy_k_1, y_prev) # n=feature, hyy = 20n x 20n
             hxy_k_1 = eval_hessian(hx_k_1, y_prev)
+
             
-
-            print('Hxy, Hyy update')
+            # tk=0.8/0.9
             # update Hxy via 12a
-            # Hxy_cuda = torch.from_numpy(Hxy_k).cuda() if o_step > 0 else None
-            # Hyy_cuda = torch.from_numpy(Hyy_k).cuda() if o_step > 0 else None
-            Hxy_k = (1-0.5)*(Hxy_k.detach()-hxy_k_1.detach()) + hxy_k.detach() if o_step > 0  else torch.clone(hxy_k)
-            # Hxy_prev = torch.clone(Hxy_k)
-            '''
-            if Hxy_k == None:
-                Hxy_k = hxy_k.requires_grad_(False)
-            else:
-                # print('Hxy-1:', Hxy_history[-1].shape, '; hxy-1:', hxy_k_1.shape, '; hxy:',hxy_k.shape)
-                Hxy_k = ((1-0.3)*(Hxy_k-hxy_k_1) + hxy_k).requires_grad_(False)
-            '''
-            # Hxy_history=Hxy_k)
-
+            Hxy_k = (1-0.9)*(Hxy_k.detach()-hxy_k_1.detach()) + hxy_k.detach() if o_step > 0  else torch.clone(hxy_k)
             # update Hyy via 12b
-            Hyy_k = (1-0.5)*(Hyy_k.detach() - hyy_k_1.detach()) + hyy_k.detach() if o_step > 0  else torch.clone(hyy_k) 
-            # Hyy_prev = torch.clone(Hyy_k)
-            # used for computation
-            # Hxy_cuda = torch.from_numpy(Hxy_k).cuda()
-            # Hyy_cuda = torch.from_numpy(Hyy_k).cuda()
-
+            Hyy_k = (1-0.9)*(Hyy_k.detach() - hyy_k_1.detach()) + hyy_k.detach() if o_step > 0  else torch.clone(hyy_k) 
+            # check if positive definite
+            Hyy_np = Hyy_k.cpu().data.numpy()
+            # hxy_np = hxy_k.cpu().data.numpy()
             '''
-            if Hyy_k == None:
-                Hyy_k = hyy_k.requires_grad_(False)
+            if is_pos_def(Hyy_np):
+                print('Hyy positive definite')
+                print(type(Hyy_k))
             else:
-                Hyy_k = ((1-0.3)*(Hyy_k - hyy_k_1) + hyy_k).requires_grad_(False)
+                print('Hyy NOT PFPFPFPFPFPFPFPFPF','*'*30)
             '''
-            # Hyy_history=Hyy_k
+
 
             # compute fx_grad, fy_grad
             fy_gradient = gradient_fy(args, parameters, val_list[val_index_list[1]])
@@ -313,36 +304,30 @@ def train_model(args):
             # fx_gradient = gradient_fy(args, hparams, val_list[val_index_list[1]])
 
             # update x and y via 11
-            # del x_prev
             x_prev = [None]
             x_prev[0] = torch.clone(hparams[0]).requires_grad_(True)
-            # if torch.all(x_prev[0] == hparams[0]) != True:
-            #     print('x clone wrong')
-            # 11a without fx_gradient
             hparams[0] = hparams[0] - args.outer_lr*(-torch.matmul(-Hxy_k.detach(), torch.matmul(torch.inverse(Hyy_k).detach(), fy_gradient.detach()) ))
-            # print('x_k:', hparams[0].size())
-            # del y_prev
+
             y_prev = [None]
             y_prev[0] = torch.clone(parameters[0]).requires_grad_(True)
-            # if torch.all(y_prev[0]==parameters[0]) !=  True:
-            #     print('y clone wrong')
-
             # 11b
+            '''
             y_vec = torch.reshape(parameters[0],[-1])
             y_vec = y_vec - args.inner_lr*hy - torch.matmul(torch.inverse(Hyy_k).detach(), torch.matmul(Hxy_k.T.detach(),(hparams[0] - x_prev[0]).detach()))
             parameters[0] = torch.reshape(y_vec,(parameters[0].shape[0],parameters[0].shape[1]))
+            '''
+            for t in range(5):
+                loss_train = train_loss(parameters, hparams, train_list[train_index_list[0]])
+                hy_inner = torch.autograd.grad(loss_train, parameters, retain_graph=True, create_graph=True)[0]
+                hy_inner = torch.reshape(hy, [-1])
+                y_vec = torch.reshape(parameters[0],[-1])
+                y_vec = y_vec - args.inner_lr*hy_inner - torch.matmul(torch.inverse(Hyy_k).detach(), torch.matmul(Hxy_k.T.detach(),(hparams[0] - x_prev[0]).detach()))
+                parameters[0] = torch.reshape(y_vec,(parameters[0].shape[0],parameters[0].shape[1]))
+                print('t='+str(t))
             # print('y_k:',parameters[0].shape)
             final_params = parameters
-            '''
-            for p, new_p in zip(parameters, final_params[:len(parameters)]):
-                if warm_start:
-                    p.data = new_p
-                else:
-                    p.data = torch.zeros_like(p)
-            '''
             val_loss(final_params, hparams)
-            # del hyy_k, hxy_k, y_vec, hx, hy,loss_train, fy_gradient # , hxy_k_1, hyy_k_1, hy_k_1, hx_k_1
-            # del Hyy_k, Hxy_k
+
             torch.cuda.empty_cache()
             print('-'*30)
 
@@ -369,7 +354,7 @@ def train_model(args):
             np.save(f, loss_acc_time_results)   
 
     print(loss_acc_time_results)
-    np.savetxt('STABLE.txt',loss_acc_time_results)
+    np.savetxt('STABLE_'+str(args.seed)+'.txt',loss_acc_time_results)
     print('HPO ended in {:.2e} seconds\n'.format(total_time))
 
 
@@ -470,6 +455,8 @@ def eval_hessian(loss_grad, params):
     del grad2rd
     return hessian # .cpu().data.numpy() # hessian.cpu().data.numpy()
 
+def is_pos_def(x):
+    return np.all(np.linalg.eigvals(x) > 0)
 
 def main():
     args = parse_args()

@@ -37,19 +37,25 @@ class CustomTensorIterator:
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--n_steps', default=50, type=int, help='epoch numbers')
-    parser.add_argument('--T', default=10, type=int, help='inner update iterations')
-    parser.add_argument('--batch_size', type=int, default=1000)
-    parser.add_argument('--val_size', type=int, default=1000)
+    parser.add_argument('--T', default=5, type=int, help='inner update iterations')
+    parser.add_argument('--batch_size', type=int, default=10)
+    parser.add_argument('--val_size', type=int, default=10)
     parser.add_argument('--eta', type=float, default=0.5, help='used in Hessian')
     parser.add_argument('--K', type=int, default=10, help='number of steps to approximate hessian')
     # Only when alg == minibatch, we apply stochastic, otherwise, alg training with full batch
     parser.add_argument('--alg', type=str, default='minibatch', choices=['minibatch', 'reverse', 'fixed_point', 'CG', 'neuman'])
-    parser.add_argument('--inner_lr', type=float, default=0.1)
+    parser.add_argument('--inner_lr', type=float, default=0.01)
     parser.add_argument('--inner_mu', type=float, default=0.0)
-    parser.add_argument('--outer_lr', type=float, default=1e-5)
+    parser.add_argument('--outer_lr', type=float, default=1e-10)
     parser.add_argument('--outer_mu', type=float, default=0.0)
     parser.add_argument('--save_folder', type=str, default='', help='path to save result')
     parser.add_argument('--model_name', type=str, default='', help='Experiment name')
+    parser.add_argument(
+    '--seed',
+    type=int,
+    default=5,
+    metavar='S',
+    help='random seed (default: 1)')
     args = parser.parse_args()
     # outer_lr, outer_mu = 100.0, 0.0  # nice with 100.0, 0.0 (torch.SGD) tested with T, K = 5, 10 and CG
     # inner_lr, inner_mu = 100., 0.9   # nice with 100., 0.9 (HeavyBall) tested with T, K = 5, 10 and CG
@@ -86,6 +92,7 @@ def train_model(args):
     default_tensor_str = 'torch.cuda.FloatTensor' if cuda else 'torch.FloatTensor'
     kwargs = {} # {'num_workers': 1, 'pin_memory': True} if cuda else {}
     torch.set_default_tensor_type(default_tensor_str)
+    torch.cuda.manual_seed(args.seed)
     # torch.multiprocessing.set_start_method('forkserver')
 
     # Functions 
@@ -294,6 +301,36 @@ def train_model(args):
                 else:
                     p.data = torch.zeros_like(p)
             val_loss(final_params, hparams)
+        else:
+            inner_losses = []
+            if params_history:
+                params_history = [params_history[-1]]
+            else:
+                params_history = [inner_opt.get_opt_params(parameters)]
+            for t in range(args.T):
+                params_history.append(inner_opt(params_history[-1], hparams, create_graph=False))
+                inner_losses.append(inner_opt.curr_loss)
+
+                if t % train_log_interval == 0 or t == args.T-1:
+                    print('t={} loss: {}'.format(t, inner_losses[-1]))
+
+            final_params = params_history[-1]
+            outer_opt.zero_grad()
+            if args.alg == 'reverse':
+                hg.reverse(params_history[-args.K-1:], hparams, [inner_opt]*args.K, val_loss)
+            elif args.alg == 'fixed_point':
+                hg.fixed_point(final_params, hparams, args.K, inner_opt, val_loss, stochastic=False, tol=tol)
+            elif args.alg == 'neuman':
+                hg.neumann(final_params, hparams, args.K, inner_opt, val_loss, tol=tol)
+            elif args.alg == 'CG':
+                hg.CG(final_params[:len(parameters)], hparams, args.K, inner_opt_cg, val_loss, stochastic=False, tol=tol)
+            outer_opt.step()
+
+            for p, new_p in zip(parameters, final_params[:len(parameters)]):
+                if warm_start:
+                    p.data = new_p
+                else:
+                    p.data = torch.zeros_like(p)
 
         iter_time = time.time() - start_time
         total_time += iter_time
@@ -315,7 +352,7 @@ def train_model(args):
             np.save(f, loss_acc_time_results)   
 
     print(loss_acc_time_results)
-    np.savetxt('stocBiO.txt',loss_acc_time_results)
+    np.savetxt('stocBiO_'+str(args.seed)+'.txt',loss_acc_time_results)
     print('HPO ended in {:.2e} seconds\n'.format(total_time))
 
     # plt.title('val_accuracy_'+str(args.alg))
