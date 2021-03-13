@@ -9,4 +9,8 @@ CIFAR10(unfinished): 10 classes x (3x32x32) features
 
 
 notes:
-        potential datasets: STL10, USPS, drybean, eletrical grid, smartphone
+
+potential datasets: STL10, USPS, drybean, eletrical grid, smartphone
+
+future task: meta learning
+
