@@ -34,7 +34,7 @@ class CustomTensorIterator:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--n_steps', default=80, type=int, help='epoch numbers')
+    parser.add_argument('--n_steps', default=80, type=int, help='epoch numbers') 
     parser.add_argument('--T', default=10, type=int, help='inner update iterations')
     parser.add_argument('--batch_size', type=int, default=10)
     parser.add_argument('--val_size', type=int, default=10)
@@ -208,10 +208,10 @@ def train_model(args):
     hparams = [l2_reg_params] # x = hparams[0]
     print('x:',hparams[0].size())
     # hparams: the outer variables (or hyperparameters)
-    ones_dxc = torch.ones(n_features, n_classes)
+    # ones_dxc = torch.ones(n_features, n_classes)
 
     # outer_opt = torch.optim.SGD(lr=args.outer_lr, momentum=args.outer_mu, params=hparams)
-    outer_opt = torch.optim.Adam(lr=args.outer_lr, params=hparams)
+    # outer_opt = torch.optim.Adam(lr=args.outer_lr, params=hparams)
 
     '''
     For STABLE, params_history is not required, but we need to save Hxy and Hyy
@@ -219,7 +219,7 @@ def train_model(args):
     val_losses, val_accs = [], []
     test_losses, test_accs = [], []
     w = torch.zeros(n_features, n_classes).requires_grad_(True)
-    parameters = [w] # y = parameters[0]
+    parameters = [w] # y = parameters[0] # 10x780
     print('y:',parameters[0].size())
 
     # params_history: the inner iterates (from first to last)
@@ -238,11 +238,12 @@ def train_model(args):
     # Hxy_prev = None
     # Hyy_prev = None
 
-    x_prev = hparams.copy()
+    x_prev = hparams.copy() # torch.clone 
     y_prev = parameters.copy()
     # Hxy_history = []
     # Hyy_history = []
     
+    # start training
     for o_step in range(args.n_steps):
         train_index_list = torch.randperm(train_list_len)
         print(train_index_list[0])
@@ -258,7 +259,7 @@ def train_model(args):
             # hy => hg in STABLE
             loss_train = train_loss(parameters, hparams, train_list[train_index_list[0]])
             hy = torch.autograd.grad(loss_train, parameters, retain_graph=True, create_graph=True)[0]
-            hy = torch.reshape(hy, [-1])
+            hy = torch.reshape(hy, [-1]) # matrix->vector
             # print('hy:', hy.size())
             # test: compute hxx, hessian
             hx = torch.autograd.grad(loss_train, hparams, retain_graph=True, create_graph=True)[0]
@@ -286,7 +287,7 @@ def train_model(args):
             # update Hyy via 12b
             Hyy_k = (1-0.9)*(Hyy_k.detach() - hyy_k_1.detach()) + hyy_k.detach() if o_step > 0  else torch.clone(hyy_k) 
             # check if positive definite
-            Hyy_np = Hyy_k.cpu().data.numpy()
+            # Hyy_np = Hyy_k.cpu().data.numpy()
             # hxy_np = hxy_k.cpu().data.numpy()
             '''
             if is_pos_def(Hyy_np):
@@ -324,13 +325,12 @@ def train_model(args):
                 y_vec = y_vec - args.inner_lr*hy_inner - torch.matmul(torch.inverse(Hyy_k).detach(), torch.matmul(Hxy_k.T.detach(),(hparams[0] - x_prev[0]).detach()))
                 parameters[0] = torch.reshape(y_vec,(parameters[0].shape[0],parameters[0].shape[1]))
                 print('t='+str(t))
-            # print('y_k:',parameters[0].shape)
+            # inner loop done
             final_params = parameters
             val_loss(final_params, hparams)
 
             torch.cuda.empty_cache()
             print('-'*30)
-
         iter_time = time.time() - start_time
         total_time += iter_time
         if o_step % val_log_interval == 0 or o_step == args.T-1:
@@ -412,21 +412,8 @@ def out_f(x, params):
     out += params[1] if len(params) == 2 else 0
     return out
 # torch.cat -> index copy
-def eval_hessian(loss_grad, params):
-    # cnt = 0
+def eval_hessian(loss_grad, params): # loss_grad = hx or hy
     print('loss_grad: ',loss_grad.size())
-    # g_vector = loss_grad
-    '''
-    g_count = 0
-    for g in loss_grad:
-        # loss_grad = g.contiguous().view(-1) if cnt == 0 else torch.cat([loss_grad, g.contiguous().view(-1)])
-        # cnt = 1
-        loss_grad[g_count] = g.contiguous().view(-1)
-        g_count += 1 # g_cound => loss_grad.size()
-    # print('loss_grad:',loss_grad.size())
-    if torch.all(loss_grad == loss_grad) == True:
-        print('very useless')
-    '''
     l = loss_grad.size(0)
     # print('xd:', l)
     l2 = torch.reshape(params[0],[-1]).size(0)
@@ -435,21 +422,7 @@ def eval_hessian(loss_grad, params):
     # print('hessian: ',hessian.size())
     for idx in range(l):
         grad2rd = torch.autograd.grad(loss_grad[idx], params,retain_graph=True)
-        '''
-        cnt = 0
-        g2 = torch.zeros(hessian[0].size())
-        # print('g2:', g2.size())
-        for g in grad2rd:
-            # g2_old = g.contiguous().view(-1) if cnt == 0 else torch.cat([g2_old, g.contiguous().view(-1)])
-            # cnt = 1
-            # print('g contiguous: ',g.contiguous().view(-1).size(),';g2_old:', g2.size(),';g2:', g2.size())
-            g2 = g.contiguous().view(-1)
-            cnt += 1
-            if cnt >1 :
-                print('cnt',cnt)
-        if torch.all(g2 == torch.reshape(grad2rd[0],[-1])) != True:
-            print('sometimes useful')
-        '''
+        
         # print('g2: ',g2.size(),'; hessian[index]:', hessian[idx].size(), 'g2_old:',g2_old.size())
         hessian[idx] = torch.reshape(grad2rd[0],[-1]).detach()
     del grad2rd
