@@ -5,12 +5,12 @@ l2g_20news: 20 classes x 850 features
 
 MNIST: 10 classes x 780 features (torchvision)
 
-CIFAR10(unfinished): 10 classes x (3x32x32) features
+CIFAR10,STL10(unfinished): 10 classes x (3x32x32) features
 
 
 notes:
 
-potential datasets: STL10, USPS, drybean, eletrical grid, smartphone
+datasets: USPS(same as MNIST), drybean, eletrical grid(Y), smartphone(X), mushroom
 
 future task: meta learning
 
