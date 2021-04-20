@@ -10,7 +10,7 @@ CIFAR10,STL10(unfinished): 10 classes x (3x32x32) features
 
 notes:
 
-datasets: USPS(same as MNIST,in MNIST folder), drybean, eletrical grid(Y), smartphone(X), mushroom
+datasets: USPS(same as MNIST,in MNIST folder), drybean(X), eletrical grid(Y), smartphone(X), mushroom(Y?), Sonar(Y), Musk(Y), ionosphere(X)
 
 future task: meta learning
 
