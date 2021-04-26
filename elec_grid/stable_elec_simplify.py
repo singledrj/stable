@@ -1,0 +1,433 @@
+from itertools import repeat
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+import torchvision
+from torchvision import datasets, transforms
+
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.nn as nn
+import matplotlib
+import matplotlib.pyplot as plt
+import argparse
+import torch
+import hypergrad as hg
+import numpy as np
+import time
+import os
+import gc
+import pandas as pd 
+
+
+class CustomTensorIterator:
+    def __init__(self, tensor_list, batch_size, **loader_kwargs):
+        self.loader = DataLoader(TensorDataset(*tensor_list), batch_size=batch_size, **loader_kwargs)
+        self.iterator = iter(self.loader)
+
+    def __next__(self, *args):
+        try:
+            idx = next(self.iterator)
+        except StopIteration:
+            self.iterator = iter(self.loader)
+            idx = next(self.iterator)
+        return idx
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--n_steps', default=80, type=int, help='epoch numbers')
+    parser.add_argument('--T', default=10, type=int, help='inner update iterations')
+    parser.add_argument('--batch_size', type=int, default=10)
+    parser.add_argument('--val_size', type=int, default=10)
+    parser.add_argument('--eta', type=float, default=0.5, help='used in Hessian')
+    parser.add_argument('--K', type=int, default=10, help='number of steps to approximate hessian')
+    # Only when alg == minibatch, we apply stochastic, otherwise, alg training with full batch
+    parser.add_argument('--alg', type=str, default='minibatch', choices=['minibatch', 'reverse', 'fixed_point', 'CG', 'neuman'])
+    parser.add_argument('--inner_lr', type=float, default=0.3) # beta
+    parser.add_argument('--inner_mu', type=float, default=0.0)
+    parser.add_argument('--outer_lr', type=float, default=3e-6) # alpha
+    parser.add_argument('--outer_mu', type=float, default=0.0)
+    parser.add_argument('--save_folder', type=str, default='', help='path to save result')
+    parser.add_argument('--model_name', type=str, default='', help='Experiment name')
+    parser.add_argument('--seed', type=int, default=1, metavar='S', help='random seed (default: 1)')
+    args = parser.parse_args()
+    args = parser.parse_args()
+    # outer_lr, outer_mu = 100.0, 0.0  # nice with 100.0, 0.0 (torch.SGD) tested with T, K = 5, 10 and CG
+    # inner_lr, inner_mu = 100., 0.9   # nice with 100., 0.9 (HeavyBall) tested with T, K = 5, 10 and CG
+    # parser.add_argument('--seed', type=int, default=0)
+
+    if not args.save_folder:
+        args.save_folder = './save_results'
+    args.model_name = '{}_bs_{}_vbs_{}_olrmu_{}_{}_ilrmu_{}_{}_eta_{}_T_{}_K_{}'.format(args.alg, 
+                       args.batch_size, args.val_size, args.outer_lr, args.outer_mu, args.inner_lr, 
+                       args.inner_mu, args.eta, args.T, args.K)
+    args.save_folder = os.path.join(args.save_folder, args.model_name)
+    if not os.path.isdir(args.save_folder):
+        os.makedirs(args.save_folder)
+    # parser.add_argument('--save_folder', type=str, default='', help='path to save result')
+    # parser.add_argument('--model_name', type=str, default='', help='Experiment name')
+    return args
+
+
+def train_model(args):
+
+    # Constant
+    tol = 1e-12
+    warm_start = True
+    bias = False  # without bias outer_lr can be bigger (much faster convergence)
+    train_log_interval = 100
+    val_log_interval = 1
+
+    # Basic Setting 
+    # seed = 0
+    # torch.manual_seed(seed)
+    np.random.seed(args.seed)
+
+    cuda = True and torch.cuda.is_available() # torch.cuda.is_available() # cuda=False -> CPU version
+    torch.cuda.set_device(1)
+    default_tensor_str = 'torch.cuda.FloatTensor' if cuda else 'torch.FloatTensor'
+    kwargs = {} # {'num_workers': 1, 'pin_memory': True} if cuda else {}
+    torch.set_default_tensor_type(default_tensor_str)
+    torch.cuda.manual_seed(args.seed)
+    # torch.multiprocessing.set_start_method('forkserver')
+
+    # Functions 
+    def frnp(x): return torch.from_numpy(x).cuda().float() if cuda else torch.from_numpy(x).float() # from numpy
+    def tonp(x, cuda=cuda): return x.detach().cpu().numpy() if cuda else x.detach().numpy() # to numpy
+    def train_loss(params, hparams, data):
+        x_mb, y_mb = data
+        # print(x_mb.size()) = torch.Size([5657, 130107])
+        out = out_f(x_mb,  params)
+        return F.cross_entropy(out, y_mb) + reg_f(params, *hparams)
+    def val_loss(opt_params, hparams):
+        x_mb, y_mb = next(val_iterator)
+        # print(x_mb.size()) = torch.Size([5657, 130107])
+        out = out_f(x_mb,  opt_params[:len(parameters)])
+        val_loss = F.cross_entropy(out, y_mb)
+        pred = out.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+        acc = pred.eq(y_mb.view_as(pred)).sum().item() / len(y_mb)
+
+        val_losses.append(tonp(val_loss))
+        val_accs.append(acc)
+        return val_loss
+    def reg_f(params, l2_reg_params, l1_reg_params=None):
+        r = 0.5 * ((params[0] ** 2) * torch.exp(l2_reg_params.unsqueeze(1) * ones_dxc)).mean()
+        if l1_reg_params is not None:
+            r += (params[0].abs() * torch.exp(l1_reg_params.unsqueeze(1) * ones_dxc)).mean()
+        return r
+    def out_f(x, params):
+        out = x @ params[0]
+        out += params[1] if len(params) == 2 else 0
+        # print(out.shape)
+        return out
+    # evaluate
+    def eval(params, x, y):
+        out = out_f(x,  params)
+        loss = F.cross_entropy(out, y)
+        pred = out.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+        acc = pred.eq(y.view_as(pred)).sum().item() / len(y)
+
+        return loss, acc
+
+    
+    # load MNIST
+    # load dataset
+    val_size_ratio = 0.5
+
+    reader = pd.read_csv("elec_grid_stab/Data_for_UCI_named.csv")  
+    df = pd.DataFrame(reader, columns= ['stabf'])
+    label_letter = list(df['stabf'])
+    label = [ 0 if label_letter[i]=='unstable' else 1 for i in range(len(label_letter))]
+    y = np.array(label)
+    data = np.genfromtxt('elec_grid_stab/Data_for_UCI_named.csv', delimiter=',')
+    x = data[1:, :-1]
+    x = normalize(x)
+    # random the data
+    idx =np.random.choice(x.shape[0],size=x.shape[0],replace=False)
+    x = x[idx,:]
+    y = y[idx]
+    # split train data
+    x_all, x_test, y_all, y_test = train_test_split(x, y, stratify=y, test_size=0.2)
+
+    x_train, x_val, y_train, y_val = train_test_split(x_all, y_all, stratify=y_all, test_size=val_size_ratio)
+    
+    train_samples, n_features = x_train.shape
+    test_samples, n_features = x_test.shape
+    val_samples, n_features = x_val.shape
+
+    n_classes = np.unique(y_train).shape[0]
+    # train_samples=5657, val_samples=5657, test_samples=7532, n_features=130107, n_classes=20
+    print('Dataset 20newsgroup, train_samples=%i, val_samples=%i, test_samples=%i, n_features=%i, n_classes=%i'
+        % (train_samples, val_samples, test_samples, n_features, n_classes))
+    ys = [frnp(y_train).long(), frnp(y_val).long(), frnp(y_test).long()]
+    xs = [frnp(x_train), frnp(x_val), frnp(x_test)]
+
+
+    # x_train.size() = torch.Size([5657, 130107])
+    # y_train.size() = torch.Size([5657])
+    x_train, x_val, x_test = xs
+    y_train, y_val, y_test = ys
+    
+    # torch.DataLoader has problems with sparse tensor on GPU    
+    iterators, train_list, val_list = [], [], []
+
+    '''
+    for STABLE, also need to build list to store the splited tensor
+    '''
+    # For minibatch method, we build the list to store the splited tensor
+    if args.alg == 'minibatch':
+        for bs, x, y in [(len(y_train), x_train, y_train), (len(y_val), x_val, y_val)]:
+            iterators.append(CustomTensorIterator([x, y], batch_size=args.batch_size, shuffle=True, **kwargs))
+        train_iterator, val_iterator = iterators
+        for _ in range(train_samples // args.batch_size+1):
+            train_list.append(next(train_iterator))
+        for _ in range(val_samples // args.val_size+1):
+            val_list.append(next(val_iterator))
+        train_list_len, val_list_len = len(train_list), len(val_list)
+
+        # set up another train_iterator & val_iterator to make sure train_list and val_list are full
+        iterators = []
+        for bs, x, y in [(len(y_train), x_train, y_train), (len(y_val), x_val, y_val)]:
+            iterators.append(repeat([x, y]))
+        train_iterator, val_iterator = iterators
+    else:
+        for bs, x, y in [(len(y_train), x_train, y_train), (len(y_val), x_val, y_val)]:
+            iterators.append(repeat([x, y]))
+        train_iterator, val_iterator = iterators
+       
+
+    # Initialize parameters
+    l2_reg_params = torch.zeros(n_features).requires_grad_(True)  # one hp per feature
+    l1_reg_params = (0.*torch.ones(1)).requires_grad_(True)  # one l1 hp only (best when really low)
+    #l2_reg_params = (-20.*torch.ones(1)).requires_grad_(True)  # one l2 hp only (best when really low)
+    #l1_reg_params = (-1.*torch.ones(n_features)).requires_grad_(True)
+    hparams = [l2_reg_params] # x = hparams[0]
+    print('x:',hparams[0].size())
+    # hparams: the outer variables (or hyperparameters)
+    ones_dxc = torch.ones(n_features, n_classes)
+
+    # outer_opt = torch.optim.SGD(lr=args.outer_lr, momentum=args.outer_mu, params=hparams)
+    outer_opt = torch.optim.Adam(lr=args.outer_lr, params=hparams)
+
+    '''
+    For STABLE, params_history is not required, but we need to save Hxy and Hyy
+    '''
+    val_losses, val_accs = [], []
+    test_losses, test_accs = [], []
+    w = torch.zeros(n_features, n_classes).requires_grad_(True)
+    parameters = [w] # y = parameters[0]
+    print('y:',parameters[0].size())
+
+    # params_history: the inner iterates (from first to last)
+    if bias:
+        b = torch.zeros(n_classes).requires_grad_(True)
+        parameters.append(b)
+ 
+
+    total_time = 0
+    loss_acc_time_results = np.zeros((args.n_steps+1, 3))
+    test_loss, test_acc = eval(parameters, x_test, y_test)
+    loss_acc_time_results[0, 0] = test_loss
+    loss_acc_time_results[0, 1] = test_acc
+    loss_acc_time_results[0, 2] = 0.0
+    
+    # Hxy_prev = None
+    # Hyy_prev = None
+
+    x_prev = hparams.copy()
+    y_prev = parameters.copy()
+    # Hxy_history = []
+    # Hyy_history = []
+    
+    for o_step in range(args.n_steps):
+        train_index_list = torch.randperm(train_list_len)
+        print(train_index_list[0])
+        val_index_list = torch.randperm(val_list_len)
+        print(val_index_list[0])
+        start_time = time.time()
+        #  x -> hparas
+        #  y -> parameters
+        if args.alg == 'minibatch': # edit in this if statement: stocBiO -> STABLE
+            # hy = torch.autograd.grad(loss_train, parameters)
+            # two hy should be same, but gradient_gy creat_graph=True
+            # compute hy = gy , inner grad of stocBiO
+            # hy => hg in STABLE
+            loss_train = train_loss(parameters, hparams, train_list[train_index_list[0]])
+            hy = torch.autograd.grad(loss_train, parameters, retain_graph=True, create_graph=True)[0]
+            hy = torch.reshape(hy, [-1])
+            # print('hy:', hy.size())
+            # test: compute hxx, hessian
+            hx = torch.autograd.grad(loss_train, hparams, retain_graph=True, create_graph=True)[0]
+            hx = torch.reshape(hx,[-1])
+            # hxx = eval_hessian(hx, hparams)
+            # print('test hessian_xx',hxx.shape)
+            print('Hessian break point 1')
+            hyy_k = eval_hessian(hy, parameters) # torch.from_numpy(eval_hessian(hy, parameters)).detach().cuda()
+            hxy_k = eval_hessian(hx, parameters) # torch.from_numpy(eval_hessian(hx, parameters)).detach().cuda()
+            # print('test hessian_xy',hxy_k.shape)
+            
+            # compute hyy_k-1 and hxy_k-1
+            '''
+            loss_train_k_1 = train_loss(y_prev, x_prev, train_list[train_index_list[0]])
+            hy_k_1 = torch.autograd.grad(loss_train_k_1, y_prev, retain_graph=True, create_graph=True)[0]
+            hy_k_1 = torch.reshape(hy_k_1, [-1])
+            hx_k_1 = torch.autograd.grad(loss_train_k_1, x_prev, retain_graph=True, create_graph=True)[0]
+            hx_k_1 = torch.reshape(hx_k_1, [-1])
+            hyy_k_1 = eval_hessian(hy_k_1, y_prev) # n=feature, hyy = 20n x 20n
+            hxy_k_1 = eval_hessian(hx_k_1, y_prev)
+            '''
+
+            
+            # tk=0.8/0.9 -> 1
+            # update Hxy via 12a
+            # Hxy_k = (1-0.8)*(Hxy_k.detach()-hxy_k_1.detach()) + hxy_k.detach() if o_step > 0  else torch.clone(hxy_k)
+            # update Hyy via 12b
+            # Hyy_k = (1-0.8)*(Hyy_k.detach() - hyy_k_1.detach()) + hyy_k.detach() if o_step > 0  else torch.clone(hyy_k) 
+
+
+            # compute fx_grad, fy_grad
+            fy_gradient = gradient_fy(args, parameters, val_list[val_index_list[1]])
+            # print('fy shape:',fy_gradient.shape)
+            fy_gradient = torch.reshape(fy_gradient, [-1]).detach()
+            # fx_gradient = gradient_fy(args, hparams, val_list[val_index_list[1]])
+
+            # update x and y via 11
+            x_prev = [None]
+            x_prev[0] = torch.clone(hparams[0]).requires_grad_(True)
+            hparams[0] = hparams[0] - args.outer_lr*(-torch.matmul(-hxy_k.detach(), torch.matmul(torch.inverse(hyy_k).detach(), fy_gradient.detach()) ))
+
+            y_prev = [None]
+            y_prev[0] = torch.clone(parameters[0]).requires_grad_(True)
+            # 11b
+            
+            y_vec = torch.reshape(parameters[0],[-1])
+            y_vec = y_vec - args.inner_lr*hy - torch.matmul(torch.inverse(hyy_k).detach(), torch.matmul(hxy_k.T.detach(),(hparams[0] - x_prev[0]).detach()))
+            parameters[0] = torch.reshape(y_vec,(parameters[0].shape[0],parameters[0].shape[1]))
+
+            final_params = parameters
+            val_loss(final_params, hparams)
+
+            torch.cuda.empty_cache()
+            print('-'*30)
+
+        iter_time = time.time() - start_time
+        total_time += iter_time
+        if o_step % val_log_interval == 0 or o_step == args.T-1:
+            test_loss, test_acc = eval(final_params[:len(parameters)], x_test, y_test)
+            loss_acc_time_results[o_step+1, 0] = test_loss
+            loss_acc_time_results[o_step+1, 1] = test_acc
+            loss_acc_time_results[o_step+1, 2] = total_time
+            print('o_step={} ({:.2e}s) Val loss: {:.4e}, Val Acc: {:.2f}%'.format(o_step, iter_time, val_losses[-1],
+                                                                                100*val_accs[-1]))
+            print('          Test loss: {:.4e}, Test Acc: {:.2f}%'.format(test_loss, 100*test_acc))
+            print('          l2_hp norm: {:.4e}'.format(torch.norm(hparams[0])))
+            print('-'*30)
+            if len(hparams) == 2:
+                print('          l1_hp : ', torch.norm(hparams[1]))
+
+    # loop done
+    # save result
+    file_name = 'results.npy'
+    file_addr = os.path.join(args.save_folder, file_name)
+    with open(file_addr, 'wb') as f:
+            np.save(f, loss_acc_time_results)   
+
+    print(loss_acc_time_results)
+    np.savetxt('STABLE_'+str(args.seed)+'.txt',loss_acc_time_results)
+    print('HPO ended in {:.2e} seconds\n'.format(total_time))
+
+
+
+def from_sparse(x):
+    x = x.tocoo()
+    values = x.data
+    indices = np.vstack((x.row, x.col))
+
+    i = torch.LongTensor(indices)
+    v = torch.FloatTensor(values)
+    shape = x.shape
+
+    return torch.sparse.FloatTensor(i, v, torch.Size(shape))
+
+def gradient_fy(args, parameters, data):
+    images, labels = data
+    out = out_f(images,  parameters)
+    #print(out.shape)
+    loss = F.cross_entropy(out, labels)
+    grad = torch.autograd.grad(loss, parameters)[0]
+    return grad
+
+
+def train_loss(params, hparams, data):
+    x_mb, y_mb = data
+    out = out_f(x_mb,  params)
+    return F.cross_entropy(out, y_mb) + reg_f(params, *hparams)
+
+def gradient_gy(args, parameters, data, weight):
+    train_loss_ = train_loss(parameters, weight, data)
+    grad = torch.autograd.grad(train_loss_, parameters, create_graph=True)[0]
+    return grad
+
+def val_loss(opt_params, hparams):
+    x_mb, y_mb = next(val_iterator)
+    out = out_f(x_mb,  opt_params[:len(parameters)])
+    val_loss = F.cross_entropy(out, y_mb)
+    pred = out.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+    acc = pred.eq(y_mb.view_as(pred)).sum().item() / len(y_mb)
+
+    val_losses.append(tonp(val_loss))
+    val_accs.append(acc)
+    return val_loss
+
+def reg_f(params, l2_reg_params, l1_reg_params=None):
+    ones_dxc = torch.ones(params[0].size())
+    r = 0.5 * ((params[0] ** 2) * torch.exp(l2_reg_params.unsqueeze(1) * ones_dxc)).mean()
+    if l1_reg_params is not None:
+        r += (params[0].abs() * torch.exp(l1_reg_params.unsqueeze(1) * ones_dxc)).mean()
+    return r
+
+def out_f(x, params):
+    out = x @ params[0]
+    out += params[1] if len(params) == 2 else 0
+    return out
+# torch.cat -> index copy
+def eval_hessian(loss_grad, params):
+    print('loss_grad: ',loss_grad.size())
+    l = loss_grad.size(0)
+    # print('xd:', l)
+    l2 = torch.reshape(params[0],[-1]).size(0)
+    # print('yd:', l2)
+    hessian = torch.zeros(l, l2).requires_grad_(False)
+    # print('hessian: ',hessian.size())
+    for idx in range(l):
+        grad2rd = torch.autograd.grad(loss_grad[idx], params,retain_graph=True)
+        hessian[idx] = torch.reshape(grad2rd[0],[-1]).detach()
+    del grad2rd
+    return hessian # .cpu().data.numpy() # hessian.cpu().data.numpy()
+
+def is_pos_def(x):
+    return np.all(np.linalg.eigvals(x) > 0)
+
+def normalize(data):
+    output= np.zeros_like(data)
+    for index in range(data.shape[1]):
+        sum_value = 0
+        for k in range(data.shape[0]):
+            sum_value += data[k][index]
+        mean = sum_value / (data.shape[0])
+
+        sum_difference_sq = 0
+        for k in range(data.shape[0]):
+            sum_difference_sq += (data[k][index] - mean) ** 2
+        std = (sum_difference_sq / (len(data) - 1)) ** 0.5
+        for k in range(len(data)):
+            output[k][index] = (data[k][index] - mean) / std
+    return output
+
+def main():
+    args = parse_args()
+    print(args)
+    train_model(args)
+
+if __name__ == '__main__':
+    main()
